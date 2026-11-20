@@ -937,16 +937,49 @@ const cloudUser=sessionData.user;gate.hidden=true;
 cloudClient.auth.onAuthStateChange((event)=>{if(event==='PASSWORD_RECOVERY'){setTimeout(async()=>{const pw=await guidePromptPassword('가이드노트 새 비밀번호를 입력하세요 (8자 이상).');if(!pw)return;if(pw.length<8){guideAlert('8자 이상 입력해 주세요.');return;}const {error}=await cloudClient.auth.updateUser({password:pw});guideAlert(error?'비밀번호 변경 실패: '+error.message:'비밀번호를 변경했습니다.');},300);}});
 const cloudBar=document.getElementById('cloudActions'), cloudStatus=document.getElementById('cloudStatus');cloudBar.hidden=false;document.getElementById('cloudMenuButton').onclick=()=>document.getElementById('cloudDialog').showModal();document.getElementById('cloudDialogClose').onclick=()=>document.getElementById('cloudDialog').close();
 document.getElementById('cloudUser').textContent=cloudUser.email;
-const setCloudStatus=msg=>{cloudStatus.textContent=msg;};
+const cloudSaveIndicator=document.createElement('div');
+cloudSaveIndicator.id='cloudSaveIndicator';
+cloudSaveIndicator.setAttribute('role','status');
+cloudSaveIndicator.setAttribute('aria-live','polite');
+cloudSaveIndicator.style.cssText='font-size:12px;line-height:1.5;margin-top:4px;color:#425466;';
+const storageInfo=document.getElementById('storageStatus');
+storageInfo?.insertAdjacentElement('afterend',cloudSaveIndicator);
+const setCloudStatus=msg=>{cloudStatus.textContent=msg;cloudSaveIndicator.textContent=msg;};
 let cloudEnabled=false, cloudTimer=null, cloudBusy=false, cloudPending=false;
 const SYNC_BASE_KEY='guide_note_v3_base_'+cloudUser.id;
 const SYNC_SETTINGS_KEY='guide_note_v3_settings_'+cloudUser.id;
 function readJSON(k,fallback){try{return JSON.parse(localStorage.getItem(k))??fallback}catch{return fallback}}
 function writeJSON(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){console.warn('Local sync metadata unavailable',e)}}
-async function readRemoteNotes(){
- const {data,error}=await cloudClient.from('guide_notes').select('id,title,content,category,sort_order,updated_at,deleted_at').eq('user_id',cloudUser.id).order('updated_at',{ascending:true}).limit(5000);
- if(error)throw error;
- return (data||[]).map(row=>({row,note:row.deleted_at?null:JSON.parse(row.content)}));
+// Fetch full snapshot only once per account/device, then use an updated_at cursor.
+// The timestamp is advanced only after a successful merge and persistence.
+const REMOTE_CACHE_KEY='guide_note_v4_remote_'+cloudUser.id;
+const REMOTE_CURSOR_KEY='guide_note_v4_cursor_'+cloudUser.id;
+async function readRemoteNotes({full=false}={}){
+ const cursor=full?null:readJSON(REMOTE_CURSOR_KEY,null);
+ const cached=full?[]:readJSON(REMOTE_CACHE_KEY,null);
+ const useDelta=Boolean(cursor&&Array.isArray(cached));
+ let all=[],offset=0;
+ while(true){
+  let query=cloudClient.from('guide_notes').select('id,title,content,category,sort_order,updated_at,deleted_at')
+   .eq('user_id',cloudUser.id).order('updated_at',{ascending:true}).order('id',{ascending:true});
+  // Inclusive cursor avoids missing rows sharing the same timestamp.
+  if(useDelta)query=query.gte('updated_at',cursor);
+  const {data,error}=await query.range(offset,offset+499);
+  if(error)throw error;
+  all.push(...(data||[]));
+  if(!data||data.length<500)break;
+  offset+=500;
+  if(offset>50000)throw Error('동기화 데이터가 너무 많습니다. 관리자에게 문의하세요.');
+ }
+ const byId=new Map((useDelta?cached:[]).map(r=>[r.id,r]));
+ for(const row of all)byId.set(row.id,row);
+ const combined=[...byId.values()];
+ const parsed=combined.map(row=>{
+  let note=null;
+  if(!row.deleted_at){try{note=JSON.parse(row.content)}catch{throw Error('서버 문구 데이터가 손상되었습니다: '+row.id)}}
+  return {row,note};
+ });
+ return {rows:parsed, raw:combined, cursor:all.length?all[all.length-1].updated_at:(useDelta?cursor:null)};
 }
 async function readRemoteSettings(){const {data,error}=await cloudClient.from('guide_settings').select('settings').eq('user_id',cloudUser.id).maybeSingle();if(error)throw error;return data?.settings||{};}
 async function uploadChangedImage(id){
@@ -1300,9 +1333,9 @@ async function openEditor(t){stagedImages=await Promise.all((t?.imageIds||[]).ma
  if(!original)return guideAlert('원본 내용을 찾을 수 없어요.');
  for(const x of stagedImages)if(x.fresh)await imgPut(x.id,x.data);
  const copy={id:Date.now()+Math.random(),title:title+' (복사본)',body,category:$('category').value,imageIds:stagedImages.map(x=>x.id),favorite:false,cardColor:normalizeMemoColor($('memoCardColor').value)||'#ffffff',fontSize:$('memoFontSize').value==='default'?null:Number($('memoFontSize').value),fontWeight:$('memoFontWeight').value==='default'?null:Number($('memoFontWeight').value),order:Math.min(0,...data.map(x=>Number.isFinite(x.order)?x.order:0))-1};
- data.unshift(copy);saveData();$('editor').close();render();
+ data.unshift(copy);saveData();setCloudStatus('기기에 저장됨 · 클라우드 동기화 대기 중…');$('editor').close();render();
 };
-$('save').onclick=async()=>{let title=$('title').value.trim(),body=$('body').value.trim();if(!title||!body)return guideAlert('제목과 내용을 입력해 주세요.');let obj={id:editId??(Date.now()+Math.random()),title,body,category:$('category').value,imageIds:stagedImages.map(x=>x.id),favorite:data.find(x=>x.id===editId)?.favorite||false,cardColor:normalizeMemoColor($('memoCardColor').value)||'#ffffff',fontSize:$('memoFontSize').value==='default'?null:Number($('memoFontSize').value),fontWeight:$('memoFontWeight').value==='default'?null:Number($('memoFontWeight').value),order:data.find(x=>x.id===editId)?.order??(Math.min(0,...data.map(x=>Number.isFinite(x.order)?x.order:0))-1)};for(let x of stagedImages)if(x.fresh)await imgPut(x.id,x.data);let old=data.find(x=>x.id===editId);/* 보관 중인 다른 문구나 삭제 취소를 위해 기존 이미지 원본은 유지합니다. */if(editId!==null)data=data.map(x=>x.id===editId?obj:x);else data.unshift(obj);saveData();$('editor').close();render()};$('search').oninput=render;$('export').onclick=async()=>{let imageIds=[...new Set(data.flatMap(x=>x.imageIds||[]))];let images=await Promise.all(imageIds.map(async id=>({id,data:await imgGet(id)})));let payload={version:3,templates:data,images:images.filter(x=>x.data),categories:categories,theme:themeState};let blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='파트너스_가이드노트_백업.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};$('import').onclick=()=>$('file').click();$('file').onchange=async e=>{let f=e.target.files[0];if(!f)return;try{let raw=JSON.parse(await f.text());let d=Array.isArray(raw)?raw:raw.templates;if(!Array.isArray(d)||!d.every(x=>typeof x.title==='string'&&typeof x.body==='string'&&typeof x.category==='string'))throw Error();if(await guideConfirm('현재 내용을 백업 파일 내용으로 교체할까요?')){if(raw.images)for(let im of raw.images){if(typeof im.id==='string'&&typeof im.data==='string'&&im.data.startsWith('data:image/'))await imgPut(im.id,im.data)}data=d;if(Array.isArray(raw.categories)){categories=['전체',...raw.categories.filter(x=>typeof x==='string'&&x!=='전체')];appStore.setItem('meritz_categories_v2',JSON.stringify(categories))}if(raw.theme&&typeof raw.theme==='object'){themeState=raw.theme;applyTheme()}updateCategorySelect();saveData();render()}}catch(e){guideAlert('올바른 백업 파일이 아닙니다.')}e.target.value=''};$('reset').onclick=async()=>{if(await guideConfirm('수정한 내용을 모두 지우고 최초 상태로 되돌릴까요?')){data=SMARTNOTE_DEFAULT_TEMPLATES.map(t=>({...t}));lastDeleted=null;$('undoDelete').hidden=true;saveData();render()}};
+$('save').onclick=async()=>{let title=$('title').value.trim(),body=$('body').value.trim();if(!title||!body)return guideAlert('제목과 내용을 입력해 주세요.');let obj={id:editId??(Date.now()+Math.random()),title,body,category:$('category').value,imageIds:stagedImages.map(x=>x.id),favorite:data.find(x=>x.id===editId)?.favorite||false,cardColor:normalizeMemoColor($('memoCardColor').value)||'#ffffff',fontSize:$('memoFontSize').value==='default'?null:Number($('memoFontSize').value),fontWeight:$('memoFontWeight').value==='default'?null:Number($('memoFontWeight').value),order:data.find(x=>x.id===editId)?.order??(Math.min(0,...data.map(x=>Number.isFinite(x.order)?x.order:0))-1)};for(let x of stagedImages)if(x.fresh)await imgPut(x.id,x.data);let old=data.find(x=>x.id===editId);/* 보관 중인 다른 문구나 삭제 취소를 위해 기존 이미지 원본은 유지합니다. */if(editId!==null)data=data.map(x=>x.id===editId?obj:x);else data.unshift(obj);saveData();setCloudStatus('기기에 저장됨 · 클라우드 동기화 대기 중…');$('editor').close();render()};$('search').oninput=render;$('export').onclick=async()=>{let imageIds=[...new Set(data.flatMap(x=>x.imageIds||[]))];let images=await Promise.all(imageIds.map(async id=>({id,data:await imgGet(id)})));let payload={version:3,templates:data,images:images.filter(x=>x.data),categories:categories,theme:themeState};let blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='파트너스_가이드노트_백업.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};$('import').onclick=()=>$('file').click();$('file').onchange=async e=>{let f=e.target.files[0];if(!f)return;try{let raw=JSON.parse(await f.text());let d=Array.isArray(raw)?raw:raw.templates;if(!Array.isArray(d)||!d.every(x=>typeof x.title==='string'&&typeof x.body==='string'&&typeof x.category==='string'))throw Error();if(await guideConfirm('현재 내용을 백업 파일 내용으로 교체할까요?')){if(raw.images)for(let im of raw.images){if(typeof im.id==='string'&&typeof im.data==='string'&&im.data.startsWith('data:image/'))await imgPut(im.id,im.data)}data=d;if(Array.isArray(raw.categories)){categories=['전체',...raw.categories.filter(x=>typeof x==='string'&&x!=='전체')];appStore.setItem('meritz_categories_v2',JSON.stringify(categories))}if(raw.theme&&typeof raw.theme==='object'){themeState=raw.theme;applyTheme()}updateCategorySelect();saveData();render()}}catch(e){guideAlert('올바른 백업 파일이 아닙니다.')}e.target.value=''};$('reset').onclick=async()=>{if(await guideConfirm('수정한 내용을 모두 지우고 최초 상태로 되돌릴까요?')){data=SMARTNOTE_DEFAULT_TEMPLATES.map(t=>({...t}));lastDeleted=null;$('undoDelete').hidden=true;saveData();render()}};
 
 const themePresets=[['레드','#EF3B24','#ffffff'],['핑크','#db6290','#fff8fa'],['네이비','#17365d','#f4f7fb'],['베이지','#b9855d','#fff8f0'],['민트','#21b99b','#f0fffb'],['퍼플','#7c5ce4','#f8f5ff'],['블랙','#222222','#f3f4f6'],['버터 옐로우','#c49b38','#fff5d6'],['연그레이','#818b98','#f2f3f5'],['파스텔핑크','#cb879c','#fff0f5'],['연한카라멜','#b38b6b','#f6e9db'],['주황색','#F97316','#FFF3E8']];
 let themeState;try{themeState=JSON.parse(appStore.getItem('meritz_theme_v2'))}catch(e){}// Keep a user's saved theme on every app launch, including mobile PWA refresh/reopen.
@@ -1371,73 +1404,95 @@ async function synchronize({force=false}={}){
   await appStore.flush();
   const base=readJSON(SYNC_BASE_KEY,null);
   const local=localNotes(),L=noteMap(local);
-  const rows=await readRemoteNotes(),R=new Map(rows.map(({row,note})=>[String(note?.id||row.id),note]));
-  if(base===null && rows.length){setCloudStatus('⚠ 첫 동기화: 기존 기기 자료를 백업하고 클라우드 불러오기를 선택하세요');return}
-  const B=base||{};const merged=new Map();const changed=[];let conflicts=0;
-  for(const id of new Set([...Object.keys(B),...L.keys(),...R.keys()])){
-   const l=L.get(id)||null,r=R.get(id)||null,old=Object.prototype.hasOwnProperty.call(B,id)?B[id]:null;
-   const lc=noteHash(l)!==noteHash(old),rc=noteHash(r)!==noteHash(old);
-   if(lc&&rc&&noteHash(l)!==noteHash(r)){
-    if(r)merged.set(id,r);
-    if(l){const copy={...l,id:crypto.randomUUID(),title:(l.title||'메모')+' (충돌 복사본)'};merged.set(String(copy.id),copy);changed.push(copy);conflicts++}
-   }else if(lc){if(l)merged.set(id,l);changed.push(l||{id,_deleted:true})}
-   else if(r)merged.set(id,r);
+  const remoteSnapshot=await readRemoteNotes();
+  const rows=remoteSnapshot.rows;
+  const R=new Map(rows.filter(x=>x.note).map(x=>[String(x.note.id),x.note]));
+  const B=base||{};
+  // Safety rule: an empty or incomplete device snapshot is NEVER interpreted as a server deletion.
+  // Server-side notes are retained unless the user explicitly deletes them through a separate operation.
+  const merged=new Map(R);
+  const changed=[];
+  let conflicts=0;
+  for(const [id,l] of L){
+   const r=R.get(id);
+   const known=Object.prototype.hasOwnProperty.call(B,id);
+   if(!r){
+    const tombstone=rows.find(x=>x.row.deleted_at&&String((()=>{try{return JSON.parse(x.row.content)?.id}catch{return null}})())===id);
+    if(tombstone){
+     // A remote deletion is never silently resurrected. Keep a recovery copy locally.
+     const recovery={...l,id:crypto.randomUUID(),title:(l.title||'메모')+' (삭제 복구본)'};
+     merged.set(String(recovery.id),recovery);changed.push(recovery);conflicts++;continue;
+    }
+    merged.set(id,l);changed.push(l);continue;
+   }
+   if(noteHash(l)===noteHash(r)){merged.set(id,r);continue;}
+   if(known){
+    const old=B[id];
+    const lc=noteHash(l)!==noteHash(old),rc=noteHash(r)!==noteHash(old);
+    if(lc&&!rc){merged.set(id,l);changed.push(l);continue;}
+    if(lc&&rc){
+     merged.set(id,r);
+     const copy={...l,id:crypto.randomUUID(),title:(l.title||'메모')+' (충돌 복사본)'};
+     merged.set(String(copy.id),copy);changed.push(copy);conflicts++;continue;
+    }
+   }
+   // Unknown baseline: preserve server record and a non-destructive copy of different local content.
+   if(!known){
+    const copy={...l,id:crypto.randomUUID(),title:(l.title||'메모')+' (기기 복사본)'};
+    merged.set(String(copy.id),copy);changed.push(copy);conflicts++;
+   }
   }
-  // Newly created local notes can have non-UUID ids; database ids are mapped deterministically.
-  const idKey='guide_note_v3_ids_'+cloudUser.id;const idMap=readJSON(idKey,{});for(const {row,note} of rows){if(note?.id!=null)idMap[String(note.id)]=row.id;}
+  // Database UUIDs are transport identifiers; original note IDs are stored in JSON content.
+  const idKey='guide_note_v3_ids_'+cloudUser.id;
+  const idMap=readJSON(idKey,{});
+  for(const {row,note} of rows)if(note?.id!=null)idMap[String(note.id)]=row.id;
   function remoteId(id){if(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))return id;return idMap[id]||(idMap[id]=crypto.randomUUID())}
-  // Store the original app ID inside content; database UUIDs are transport identifiers.
-  const mutations=[];
-  for(const n of changed){const id=String(n.id);const dbid=remoteId(id);if(n._deleted){mutations.push({id:dbid,user_id:cloudUser.id,title:'',content:'',category:'',sort_order:0,deleted_at:new Date().toISOString(),updated_at:new Date().toISOString()});continue}
-   mutations.push({id:dbid,user_id:cloudUser.id,title:String(n.title||''),content:JSON.stringify(n),category:String(n.category||''),sort_order:Number(n.sortOrder||0),deleted_at:null,updated_at:new Date().toISOString()});
-  }
-  // On a first upload, the database is empty and every local note is a change.
+  // Upload referenced images before publishing note rows; retry failed uploads safely.
+  const uploaded=readJSON('guide_note_v3_uploaded_'+cloudUser.id,{});
+  for(const n of changed){for(const id of n.imageIds||[]){if(uploaded[id])continue;await uploadChangedImage(id);uploaded[id]=true;writeJSON('guide_note_v3_uploaded_'+cloudUser.id,uploaded)}}
+  const mutations=changed.map(n=>({id:remoteId(String(n.id)),user_id:cloudUser.id,title:String(n.title||''),content:JSON.stringify(n),category:String(n.category||''),sort_order:Number(n.sortOrder||0),deleted_at:null,updated_at:new Date().toISOString()}));
   if(mutations.length){const {error}=await cloudClient.from('guide_notes').upsert(mutations,{onConflict:'id'});if(error)throw error}
   writeJSON(idKey,idMap);
   const finalNotes=[...merged.values()];
+  // Download only missing images for notes received from the server.
   for(const id of new Set(finalNotes.filter(n=>!L.has(String(n.id))).flatMap(n=>n.imageIds||[])))await fetchMissingImage(id);
-  // Sync only images referenced by notes modified on this device.
-  const uploaded=readJSON('guide_note_v3_uploaded_'+cloudUser.id,{});
-  for(const n of changed){if(n._deleted)continue;for(const id of n.imageIds||[]){if(uploaded[id])continue;await uploadChangedImage(id);uploaded[id]=true;writeJSON('guide_note_v3_uploaded_'+cloudUser.id,uploaded)}}
   const settings={};for(const k of cloudKeysForSettings){const v=appStore.getItem(k);if(v!==null)settings[k]=v}
   const previous=readJSON(SYNC_SETTINGS_KEY,null);
   if(JSON.stringify(settings)!==JSON.stringify(previous)){
    const {error}=await cloudClient.from('guide_settings').upsert({user_id:cloudUser.id,settings,updated_at:new Date().toISOString()},{onConflict:'user_id'});if(error)throw error;writeJSON(SYNC_SETTINGS_KEY,settings);
   }
+  // Never replace local notes with a smaller snapshot before all remote operations succeed.
   originalSetItem('partner_kakao_templates_v1',JSON.stringify(finalNotes));data=finalNotes;render();
   const next={};for(const n of finalNotes)next[String(n.id)]=n;
-  for(const [id,n] of R)if(n===null)next[id]=null;
   writeJSON(SYNC_BASE_KEY,next);await appStore.flush();
-  setCloudStatus(conflicts?'⚠ 동기화 완료 · 충돌 복사본 '+conflicts+'개':'✓ 변경분 동기화 완료');
- }catch(e){console.error('guide sync',e);setCloudStatus('⚠ 동기화 실패 · 기기 자료 보존: '+e.message)}
- finally{cloudBusy=false;if(cloudPending){cloudPending=false;cloudTimer=setTimeout(()=>synchronize(),2500)}}
+  // Only commit the remote cache/cursor after the complete successful cycle.
+  const cachedRows=new Map(remoteSnapshot.raw.map(r=>[r.id,r]));
+  for(const row of mutations)cachedRows.set(row.id,row);
+  writeJSON(REMOTE_CACHE_KEY,[...cachedRows.values()]);
+  // Keep the server cursor (not local client timestamps) to avoid skipping server updates.
+  if(remoteSnapshot.cursor)writeJSON(REMOTE_CURSOR_KEY,remoteSnapshot.cursor);
+  setCloudStatus(conflicts?'⚠ 저장 완료 · 보존용 복사본 '+conflicts+'개':'✓ 클라우드 저장·동기화 완료 ('+finalNotes.length+'개)');
+ }catch(e){console.error('guide sync',e);setCloudStatus('⚠ 저장 실패 · 기기 자료 유지: '+e.message)}
+ finally{cloudBusy=false;if(cloudPending){cloudPending=false;cloudTimer=setTimeout(()=>synchronize(),5000)}}
 }
-function scheduleCloudSave(){if(!cloudEnabled)return;clearTimeout(cloudTimer);cloudTimer=setTimeout(()=>synchronize(),15000)}
+function scheduleCloudSave(){if(!cloudEnabled)return;clearTimeout(cloudTimer);setCloudStatus('◷ 기기에 저장됨 · 5초 후 클라우드 자동 저장');cloudTimer=setTimeout(()=>synchronize(),5000)}
 window.addEventListener('online',()=>{if(cloudEnabled)synchronize()});
+let lastForegroundCheck=Date.now();document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&cloudEnabled&&Date.now()-lastForegroundCheck>120000){lastForegroundCheck=Date.now();synchronize()}});
 // No 45-second polling and no focus-triggered full snapshot downloads.
 document.getElementById('cloudUpload').onclick=async()=>{
  if(!await guideConfirm('현재 기기 자료를 클라우드에 처음 연결할까요? 먼저 백업을 저장해 주세요.'))return;
  cloudEnabled=true;await synchronize({force:true});
 };
 document.getElementById('cloudDownload').onclick=async()=>{
- if(!await guideConfirm('클라우드의 자료를 불러올까요? 먼저 기기 자료를 백업해 주세요.'))return;
- try{
-  const rows=await readRemoteNotes(),settings=await readRemoteSettings();
-  const notes=rows.filter(x=>x.note).map(x=>x.note);
-  for(const k of cloudKeysForSettings)if(typeof settings[k]==='string')originalSetItem(k,settings[k]);
-  originalSetItem('partner_kakao_templates_v1',JSON.stringify(notes));await appStore.flush();
-  const baseline={};for(const x of rows)baseline[String(x.note?.id||x.row.id)]=x.note;
-  writeJSON(SYNC_BASE_KEY,baseline);writeJSON(SYNC_SETTINGS_KEY,settings);
-  // Download only missing referenced images, not all images on every app launch.
-  for(const id of new Set(notes.flatMap(n=>n.imageIds||[])))await fetchMissingImage(id);
-  cloudEnabled=true;await guideAlert('클라우드 자료를 불러왔습니다. 화면을 새로고침합니다.');location.reload();
- }catch(e){setCloudStatus('⚠ 불러오기 실패: '+e.message);await guideAlert(e.message)}
+ if(!await guideConfirm('클라우드 자료와 현재 기기 자료를 안전하게 합칠까요? 기존 자료는 삭제하지 않습니다.'))return;
+ cloudEnabled=true;
+ await synchronize({force:true});
 };
 document.getElementById('cloudLogout').onclick=async()=>{clearTimeout(cloudTimer);if(cloudEnabled)await synchronize();await cloudClient.auth.signOut();location.reload()};
 try{
- const base=readJSON(SYNC_BASE_KEY,null);
- if(base!==null){cloudEnabled=true;setCloudStatus('☁ 앱 시작 시 변경분 동기화 중…');await synchronize();}
- else setCloudStatus('첫 연결: 기기 자료 백업 후 클라우드 저장 또는 불러오기를 선택하세요.');
+ cloudEnabled=true;
+ setCloudStatus('☁ 자료를 안전하게 확인하는 중…');
+ await synchronize();
 }catch(e){setCloudStatus('⚠ 클라우드 확인 실패: '+e.message)}
 
 
